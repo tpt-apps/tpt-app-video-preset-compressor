@@ -77,7 +77,8 @@ Write-Host " dest:    $Dest"
 
 if (-not $SkipBuild) {
     Write-Host "-- cargo build --release --target $Target" -ForegroundColor Cyan
-    cargo build --release --target $Target -p $Crate
+    # --features hub: asset URLs become site-absolute /apps/video-compressor/...
+    cargo build --release --target $Target --features hub -p $Crate
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 }
 

@@ -48,7 +48,8 @@ if [ "$PRO" = 1 ]; then
 fi
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  cargo build --release --target "$TARGET" -p "$CRATE"
+  # --features hub: asset URLs become site-absolute /apps/video-compressor/...
+  cargo build --release --target "$TARGET" --features hub -p "$CRATE"
 fi
 
 WASM="target/$TARGET/release/tpt_app_video_preset_compressor.wasm"

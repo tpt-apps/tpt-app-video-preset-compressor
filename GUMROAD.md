@@ -24,8 +24,11 @@ that changes, update here too (and vice versa).
 
 ## File to upload
 
-Not built yet. Once packaged, this will be the Pro exe/zip produced by the
-app's `build.ps1 -Pro` (or equivalent) — see `todo.md`.
+`release\TPT-Video-Compressor-Pro.zip` (built by `./build.ps1 -Pro`; the zip
+holds the single self-contained exe — it embeds its web bundle and extracts
+it to temp on first run). Cover image: `gumroad-cover.png` in this repo (a
+real screenshot of the Pro UI with client presets saved). Rebuild both after
+any source change: `./build.ps1 -Pro`, then re-zip if the exe changed.
 
 ## Product name
 
