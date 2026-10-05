@@ -1,0 +1,75 @@
+[package]
+name = "tpt-app-video-preset-compressor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = [".", "engine", "desktop"]
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Pro edition (paid desktop build): unlimited saved per-client presets,
+# batch folder processing, no clip length limits. The free WASM build
+# compiles without it; `--features pro` is Pro.
+pro = []
+# Set only on the free bundle that build.ps1 ships to the hub
+# (public/apps/video-compressor/): asset URLs become site-absolute
+# /apps/video-compressor/... (see src/ffmpeg.rs). Trunk builds (dev serve,
+# desktop bundle) must NOT set it - they serve assets page-relative.
+hub = []
+
+[dependencies]
+tpt-appfront-core = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-core" }
+tpt-appfront-dom = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-dom" }
+tpt-video-engine = { path = "engine" }
+# Pinned to the installed wasm-bindgen CLI version — the CLI rejects wasm
+# built against a different schema version. Bump both together.
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Window",
+    "Location",
+    "Element",
+    "Node",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlAnchorElement",
+    "HtmlVideoElement",
+    "CssStyleDeclaration",
+    "HtmlCollection",
+    "Event",
+    "EventTarget",
+    "MouseEvent",
+    "DragEvent",
+    "DataTransfer",
+    "DataTransferItem",
+    "DataTransferItemList",
+    "File",
+    "FileList",
+    "FileReader",
+    "Blob",
+    "Url",
+    "DomRect",
+    "HtmlScriptElement",
+] }
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The desktop shell is a native binary; keep its codegen normal even in the
+# same workspace (the `release` profile above applies to the wasm lib build).
+[profile.release.package.tpt-video-desktop]
+opt-level = 3
