@@ -1,10 +1,16 @@
 //! JS interop with the vendored ffmpeg.wasm runtime (`assets/`).
 //!
 //! Architecture: the UMD wrapper (`ffmpeg.js`, global `FFmpegWASM`) is
-//! injected with a plain `<script>` tag; its `FFmpeg` class then spawns the
-//! web worker (`814.ffmpeg.js` passed as `classWorkerURL`) that imports the
-//! ESM core (`ffmpeg-core.js` + `ffmpeg-core.wasm`). All video work happens
-//! in that worker, so long encodes never block the UI thread.
+//! injected with a plain `<script>` tag. Do NOT pass `classWorkerURL` to
+//! `load()`: in the 0.12.15 UMD build that combination spawns a *module*
+//! worker whose dynamic-import fallback is a webpack stub that always
+//! throws ("Cannot find module"). Without it the wrapper spawns its own
+//! *classic* worker chunk (`814.ffmpeg.js`), resolved from the injected
+//! script's own directory, and a classic worker loads the core via
+//! `importScripts` — which only works with the UMD core build (plain
+//! script, no `export` statements). Hence `assets/` ships the UMD core.
+//! All video work happens in that worker, so long encodes never block
+//! the UI thread.
 //!
 //! Asset URLs are `build_asset_url`'s job, and the two build flavors differ
 //! on purpose:
@@ -15,7 +21,9 @@
 //! - plain builds (trunk dev serve, and the Pro desktop bundle that embeds
 //!   `dist/`) use page-relative names, because in both of those hosts the
 //!   page and all assets sit in the same served root.
-//! In every flavor the four ffmpeg files must ship flat next to the glue.
+//! In every flavor the four ffmpeg files must ship flat, next to the glue,
+//! with the wrapper injected from that same directory (the wrapper derives
+//! its worker URL from the script tag's src).
 
 use std::rc::Rc;
 
@@ -102,12 +110,13 @@ impl FFmpeg {
             progress(ratio, time);
         });
 
-        // Unambiguous URLs for all three files: the worker chunk is
-        // resolved by the wrapper against its own (webpack-patched) base
-        // URL, so host-relative-only paths are not safe there.
+        // Unambiguous URLs for the UMD core pair. Deliberately no
+        // `classWorkerURL` — see the module docs on why the wrapper's own
+        // classic-worker path is the only working combination here. The
+        // worker chunk is located from the injected script tag's src, so
+        // the wrapper must be injected from the same directory as these.
         let config = Object::new();
         for (key, file) in [
-            ("classWorkerURL", "814.ffmpeg.js"),
             ("coreURL", "ffmpeg-core.js"),
             ("wasmURL", "ffmpeg-core.wasm"),
         ] {

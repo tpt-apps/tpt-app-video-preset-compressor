@@ -27,6 +27,8 @@ hub = []
 tpt-appfront-core = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-core" }
 tpt-appfront-dom = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-dom" }
 tpt-video-engine = { path = "engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Pinned to the installed wasm-bindgen CLI version — the CLI rejects wasm
 # built against a different schema version. Bump both together.
 wasm-bindgen = "=0.2.128"
@@ -56,6 +58,7 @@ web-sys = { version = "0.3", features = [
     "FileList",
     "FileReader",
     "Blob",
+    "BlobPropertyBag",
     "Url",
     "DomRect",
     "HtmlScriptElement",

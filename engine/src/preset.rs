@@ -180,18 +180,10 @@ impl ExportPreset {
                     watermark: None,
                 },
             ),
-            (
-                "WebM (VP9, web embeds)",
-                ExportPreset {
-                    name: "WebM VP9".to_string(),
-                    container: Container::WebM,
-                    max_width: 1280,
-                    fps: 0,
-                    quality: Quality::Balanced,
-                    audio: Audio::Aac96,
-                    watermark: None,
-                },
-            ),
+            // No WebM/VP9 quick-fill: the current @ffmpeg/core build's
+            // libvpx-vp9 traps its wasm memory mid-encode ("memory access
+            // out of bounds"), so VP9 is not offered to users. Revisit when
+            // vendoring a newer core (see assets/README.md).
         ]
     }
 }
