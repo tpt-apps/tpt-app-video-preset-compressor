@@ -114,10 +114,22 @@ H.264/AAC source, VP8/VP9/AV1 all OK) passed 2026-10-10.
 - [x] Fixed on verification: `dyn_into::<Object>` rejected the module namespace;
       mediabunny's `QUALITY_*` presets produced files larger than the source,
       so quality is now a bits-per-pixel bitrate budget (`assets/engine.js`)
-- [ ] Verify AV1/VP9 encode inside the real WebView2 desktop exe (no GPU
-      assumed); pick the safe default codec accordingly. *Smoke-tested only:
-      the exe launches and renders the Pro UI with the codec select; the
-      encode path inside WebView2 still needs a manual run.*
+- [x] Verified inside the real WebView2 exe (driven over WebView2's DevTools
+      port): VP9, AV1 and VP8 at Small/Balanced/High all encode and play. 8 s
+      720p clip: 1.0 s (VP9) to 1.6 s (AV1). The exe runs at `https://app.localhost`,
+      a secure context where the native `showSaveFilePicker` is present, so no
+      custom save-dialog bridge is needed. VP9 stays the default.
+- [x] Streamed save verified inside the exe: the picker is called once and the
+      output streams to the chosen file (2.2 MB for a 30 s movie segment).
+- [x] Hub page (`/tools/video-compressor` in the web repo, dev server): the
+      runner mounts the app, compresses, plays back, no console errors.
+- [x] Quality levels re-tuned on real footage (SSIM vs source, headless
+      Chrome + ffmpeg `ssim`). Output is now a fraction of the **source's own
+      bitrate** (High 1.0, Balanced 0.7, Small 0.4, floor 0.01 bits/pixel/frame,
+      scaled for downscaling). Measured on a 30 s movie segment (source 0.9 Mbps
+      video): Small 0.40x size / SSIM 0.955, Balanced 0.61x / 0.961, High 0.83x /
+      0.963. On a grainy 5 Mbps 6 s vertical clip: 0.37x / 0.892, 0.62x / 0.908,
+      0.86x / 0.916. The old fixed pixel budget grew the movie to 1.5-2.1x its size.
 - [x] Decide free-tier limits: **kept at 200 MiB / 5 min**. The memory reason
       is gone (input is read lazily), but they remain the clear Pro upsell.
       Revisit only if sales data says otherwise.
@@ -126,8 +138,12 @@ H.264/AAC source, VP8/VP9/AV1 all OK) passed 2026-10-10.
       headless: streamed bytes match the buffered encode, playable, cancel is
       clean. Falls back to in-memory `BufferTarget` where the picker is missing
       (the desktop `app://` shell may lack it: unverified).
-- [ ] Batch output still buffers in memory per clip (streaming for batch needs
-      a folder picker and per-file naming; not done).
+- [x] Batch output streams into a folder chosen with `showDirectoryPicker`
+      (one file per clip, same name as the single-clip output; an existing file
+      with that name is replaced). Verified headless and inside the exe: both
+      clips land in the folder at the same sizes as single-clip runs. Cancelling
+      the folder dialog leaves the queue pending. Falls back to memory without
+      the picker.
 - [x] Rebuilt Pro exe (`release/TPT-Video-Compressor-Pro.zip`, exe 2.0 MB),
       free bundle in the web repo's `public/apps/video-compressor/` (stale
       ffmpeg files removed), and retook `gumroad-cover.png` from the Pro UI

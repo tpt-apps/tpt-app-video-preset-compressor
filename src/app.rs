@@ -1558,10 +1558,27 @@ fn start_batch(queue: &Signal<Vec<QueueItem>>, batch: &Signal<BatchState>, job: 
         }
     };
 
+    // Pro in a browser with the folder picker: each output streams into the
+    // chosen folder. Requested here, in the click handler, so the browser
+    // still treats it as a user gesture. No picker means buffer in memory.
+    let folder = directory_picker();
+
     let queue = queue.clone();
     let batch = batch.clone();
     let job = job.clone();
     wasm_bindgen_futures::spawn_local(async move {
+        let folder = match folder {
+            Some(promise) => match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(dir) => Some(dir),
+                Err(_) => {
+                    // Cancelled: leave the queue as it was so it can be run again.
+                    job.set(Job::Idle);
+                    return;
+                }
+            },
+            None => None,
+        };
+
         let total = pending.len();
         batch.set(BatchState::Running { total, finished: 0 });
         let engine = match load_engine().await {
@@ -1594,13 +1611,24 @@ fn start_batch(queue: &Signal<Vec<QueueItem>>, batch: &Signal<BatchState>, job: 
             };
 
             mark_queue_item(&queue, queue_index, QueueStatus::Working);
+            let output_name = output_file_name(&name, ext);
+            let target = match &folder {
+                Some(dir) => match create_output_in(dir, &output_name).await {
+                    Ok(handle) => Some(handle),
+                    Err(err) => {
+                        mark_queue_item(&queue, queue_index, QueueStatus::Failed(err));
+                        batch.set(BatchState::Running { total, finished: done_so_far + 1 });
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let progress: Rc<dyn Fn(f64)> = {
                 let job = job.clone();
                 Rc::new(move |ratio: f64| job_coalesce(&job, Job::Encoding(ratio.clamp(0.0, 1.0))))
             };
-            match engine.compress(&file, &spec, watermark.as_deref(), progress, None).await {
+            match engine.compress(&file, &spec, watermark.as_deref(), progress, target).await {
                 Ok(out) => {
-                    let output_name = output_file_name(&name, ext);
                     let outcome = publish_output(size, &output_name, &out, &preset);
                     let slot = BATCH_OUTPUTS.with(|slot| {
                         let mut list = slot.borrow_mut();
@@ -1622,6 +1650,43 @@ fn start_batch(queue: &Signal<Vec<QueueItem>>, batch: &Signal<BatchState>, job: 
         batch.set(BatchState::Idle);
         job.set(Job::Idle);
     });
+}
+
+/// Opens the browser's folder picker (Pro). Returns the pending promise, or
+/// `None` when the picker isn't available. Must be called from the click
+/// handler, like [`save_picker`].
+#[cfg(feature = "pro")]
+fn directory_picker() -> Option<js_sys::Promise> {
+    use js_sys::{Function, Object, Reflect};
+    let window = web_sys::window()?;
+    let show = Reflect::get(&window, &JsValue::from_str("showDirectoryPicker"))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
+    let options = Object::new();
+    Reflect::set(&options, &JsValue::from_str("mode"), &JsValue::from_str("readwrite")).ok()?;
+    show.call1(&window, &options).ok()?.dyn_into::<js_sys::Promise>().ok()
+}
+
+/// Creates (or replaces) `name` inside the chosen folder and returns its
+/// file handle, which the engine streams the encoded clip into.
+#[cfg(feature = "pro")]
+async fn create_output_in(dir: &JsValue, name: &str) -> Result<JsValue, String> {
+    use js_sys::{Function, Object, Promise, Reflect};
+    let get = Reflect::get(dir, &JsValue::from_str("getFileHandle"))
+        .map_err(|e| js_error_text(&e))?
+        .dyn_into::<Function>()
+        .map_err(|_| "the chosen folder cannot create files".to_string())?;
+    let options = Object::new();
+    Reflect::set(&options, &JsValue::from_str("create"), &JsValue::TRUE).map_err(|e| js_error_text(&e))?;
+    let promise = get
+        .call2(dir, &JsValue::from_str(name), &options)
+        .map_err(|e| js_error_text(&e))?
+        .dyn_into::<Promise>()
+        .map_err(|_| "could not create the output file".to_string())?;
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("could not create {name}: {}", js_error_text(&e)))
 }
 
 #[cfg(feature = "pro")]

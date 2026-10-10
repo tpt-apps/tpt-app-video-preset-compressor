@@ -16,16 +16,27 @@ const CODEC_CHAINS = {
   vp8: ['vp8', 'vp9', 'av1'],
 };
 
-// Quality is a video bitrate budget: target bits per pixel per frame. The
-// presets are deliberately not mediabunny's QUALITY_* constants, which are far
-// higher (about 5 Mbps at 1080p for one test clip, so a "compressed" file came
-// out bigger than its 3 Mbps H.264 source).
-const BITS_PER_PIXEL = { high: 0.10, balanced: 0.07, small: 0.04 };
+// Quality is a fraction of the source's own video bitrate. Measured on real
+// clips (SSIM against the source, see todo.md): a fixed pixels-per-second budget
+// made a movie segment already at ~0.9 Mbps grow 1.5-2x, and under-fed a grainy
+// 5 Mbps clip. Relative to the source, output is never larger than the input
+// at Small/Balanced, and quality tracks the material.
+const SOURCE_FACTOR = { high: 1.0, balanced: 0.7, small: 0.4 };
+// Floor in bits per pixel per frame, so very low-bitrate sources don't encode to
+// unwatchable video.
+const MIN_BITS_PER_PIXEL = 0.01;
 const DEFAULT_FPS = 30;
 
-function videoBitrate(quality, width, height, fps) {
-  const bpp = BITS_PER_PIXEL[quality] ?? BITS_PER_PIXEL.balanced;
-  return Math.max(200_000, Math.round(width * height * fps * bpp));
+/**
+ * Target video bitrate. sourceBps is the source file's average bitrate (0 when
+ * unknown). A downscaled output takes the matching share of the source bitrate.
+ */
+function videoBitrate(quality, width, height, fps, sourceBps, srcWidth, srcHeight) {
+  const floor = width * height * fps * MIN_BITS_PER_PIXEL;
+  const factor = SOURCE_FACTOR[quality] ?? SOURCE_FACTOR.balanced;
+  if (!(sourceBps > 0)) return Math.max(200_000, Math.round(width * height * fps * 0.07));
+  const pixelShare = Math.min(1, (width * height) / (srcWidth * srcHeight));
+  return Math.max(200_000, floor, Math.round(sourceBps * factor * pixelShare));
 }
 
 /** The source's average frame rate, or 30 when it can't be measured. */
@@ -122,7 +133,12 @@ export async function compress(file, spec, watermarkBytes, onProgress, fileHandl
   const outH = Math.max(2, Math.round((srcH * outW) / srcW / 2) * 2);
 
   const frameRate = spec.fps > 0 ? spec.fps : await sourceFrameRate(videoTrack);
-  const bitrate = videoBitrate(spec.quality, outW, outH, frameRate);
+  // spec.video_bitrate (bps) overrides the budget; used for measuring the curve.
+  const duration = await input.computeDuration();
+  const sourceBps = duration > 0 ? (file.size * 8) / duration : 0;
+  const bitrate = spec.video_bitrate > 0
+    ? spec.video_bitrate
+    : videoBitrate(spec.quality, outW, outH, frameRate, sourceBps, srcW, srcH);
   const codec = await mb.getFirstEncodableVideoCodec(CODEC_CHAINS[spec.codec] || CODEC_CHAINS.vp9, {
     width: outW, height: outH, bitrate,
   });
