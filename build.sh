@@ -9,8 +9,8 @@
 #   TPT_WEB_REPO  path to the web repo; the bundle is copied to
 #                 $TPT_WEB_REPO/public/apps/video-compressor/ (glue named
 #                 video-compressor.js, wasm keeps its _bg.wasm name, and
-#                 the vendored ffmpeg.wasm runtime is copied flat next to
-#                 them), otherwise dist/web in this repo.
+#                 the vendored engine (engine.js + mediabunny) is copied
+#                 flat next to them), otherwise dist/web in this repo.
 
 set -eu
 cd "$(dirname "$0")"
@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 CRATE=tpt-app-video-preset-compressor
 TARGET=wasm32-unknown-unknown
 OUT_NAME=video-compressor
-FFMPEG_ASSETS="ffmpeg.js 814.ffmpeg.js ffmpeg-core.js ffmpeg-core.wasm"
+ENGINE_ASSETS="engine.js mediabunny.min.mjs mediabunny.LICENSE"
 
 PRO=0
 for arg in "$@"; do
@@ -63,13 +63,12 @@ BG_WASM="$DEST/${OUT_NAME}_bg.wasm"
 [ -f "$GLUE" ] || { echo "wasm-bindgen did not produce $GLUE" >&2; exit 1; }
 [ -f "$BG_WASM" ] || { echo "wasm-bindgen did not produce $BG_WASM" >&2; exit 1; }
 
-for asset in $FFMPEG_ASSETS; do
+for asset in $ENGINE_ASSETS; do
   [ -f "assets/$asset" ] || { echo "missing vendored asset assets/$asset" >&2; exit 1; }
   cp -f "assets/$asset" "$DEST/$asset"
 done
 
-# Size report - app payload and ffmpeg core are budgeted separately (see
-# the Windows script for the rationale).
+# Size report - the app's own payload (see the Windows script).
 RAW=$(wc -c < "$BG_WASM" | tr -d ' ')
 if command -v gzip >/dev/null 2>&1; then
   GZ=$(gzip -9 -c "$BG_WASM" | wc -c | tr -d ' ')
@@ -77,9 +76,6 @@ if command -v gzip >/dev/null 2>&1; then
   if [ "$GZ" -gt 2097152 ]; then
     echo "warning: app payload exceeds the ~2 MB gzip budget" >&2
   fi
-  CORE_RAW=$(wc -c < "$DEST/ffmpeg-core.wasm" | tr -d ' ')
-  CORE_GZ=$(gzip -9 -c "$DEST/ffmpeg-core.wasm" | wc -c | tr -d ' ')
-  echo "-- ffmpeg-core.wasm (vendored, tracked separately): $CORE_RAW bytes raw, $CORE_GZ bytes gzipped"
 fi
 
 echo "-- done"

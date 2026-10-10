@@ -37,15 +37,19 @@
 - [x] Adapter layer: `tpt-video-engine` (pure, host-tested) —
       `ExportPreset` model → ffmpeg argv (`cmd::build_ffmpeg_args`) and
       `ffmpeg -i` stderr → `MediaInfo` (`probe::parse_probe_log`)
-- [x] Preset model: container, max width, fps, CRF quality, audio bitrate,
+- [x] Preset model: container, max width, fps, quality level, audio bitrate,
       optional PNG watermark (corner/margin/width %). Pro persists presets
       to localStorage as JSON
 - [x] Validation: sample clip probes correctly (640×360 h264/aac parsed from
       the worker's stderr) and compresses under several presets; output
       verified (ftyp/moov-faststart, playable in <video>)
-- [x] **VP9/WebM dropped from the UI**: the 0.12.10 core's libvpx-vp9 traps
-      its wasm memory mid-encode ("memory access out of bounds"). The engine
-      keeps the code path for a future core bump.
+- [x] **Royalty-free output only (policy)**: H.264/AAC are patent-encumbered
+      and this app ships no codec licences, so output is **WebM = VP8 + Opus**
+      only (`engine/src/cmd.rs`; a test asserts no preset can emit libx264/aac).
+      Old saved presets (`"mp4"`/`"aac*"`) load as WebM/Opus via serde aliases.
+      The 0.12.10 core's libvpx-vp9 traps its wasm memory mid-encode on every
+      flag combination (re-verified headless in node), and the core has no AV1
+      encoder, so VP8 is the best royalty-free codec available today.
 
 ## Phase 2 — Free tier ✅
 - [x] Single-clip upload (file picker + drag & drop), probe, compress,
@@ -54,7 +58,7 @@
       5-minute duration → `LimitHit` upsell message
 - [x] Free-tier upsell card → Pro edition
 - [x] Browser-verified end to end (dev page + the hub page's WasmAppRunner):
-      mount, upload, probe metadata line, 45% smaller MP4, playable result,
+      mount, upload, probe metadata line, 45% smaller MP4 (pre-policy; now WebM), playable result,
       download button
 
 ## Phase 3 — Paid desktop edition (cargo feature `pro`) ✅
@@ -84,10 +88,65 @@
       separately (see assets/README.md)
 - [x] apps.md checklist row: Built ✅
 
+## Phase 5 — Royalty-free WebCodecs engine (replaces ffmpeg.wasm) ✅ (code + browser-verified; exe encode open)
+Policy: ship **no patent-encumbered codec code**. Decode (H.264/HEVC/AAC) is
+done by the browser/OS's own licensed WebCodecs decoders; output is
+royalty-free (AV1 / VP9 / VP8 + Opus in WebM). Spike (Chrome + Edge, 618 MB
+H.264/AAC source, VP8/VP9/AV1 all OK) passed 2026-10-10.
+- [x] Spike: mediabunny (MPL-2.0) demux → WebCodecs decode → encode → WebM mux
+- [x] Vendor `mediabunny.min.mjs` + its licence into `assets/`; `assets/engine.js`
+      (probe / compress / codec fallback / watermark)
+- [x] Engine crate: `EncodeSpec` (codec, width cap, fps, quality, Opus bitrate,
+      watermark) and serde `MediaInfo`; `VideoCodec` (AV1/VP9/VP8) on presets
+- [x] `src/ffmpeg.rs` replaced by `src/engine.rs` (JS interop); ffmpeg worker,
+      log and progress plumbing dropped from `src/app.rs`
+- [x] UI: video codec select (Auto/VP9, Smallest/AV1, Compatible/VP8);
+      unsupported-input and no-encoder messages from `probe` / `capabilities`
+- [x] Batch: keeps `File` handles instead of copying every file into wasm memory
+- [x] Removed `assets/ffmpeg*.js|wasm` (32 MB core) and updated `index.html`,
+      `build.ps1`/`build.sh`, `justfile`, `assets/README.md`, and `GUMROAD.md`
+      copy (removes the GPL core obligation)
+- [x] Browser-verified (headless Chrome, `trunk` dev + Pro bundles): probe;
+      compress VP9 / AV1 / VP8 with Small / Balanced / High; output is WebM,
+      plays back at the right size; a non-video file shows an error; Pro
+      watermark overlay; Pro two-file batch. **Not yet exercised:** the hub
+      page's `WasmAppRunner` mount (web repo not run here).
+- [x] Fixed on verification: `dyn_into::<Object>` rejected the module namespace;
+      mediabunny's `QUALITY_*` presets produced files larger than the source,
+      so quality is now a bits-per-pixel bitrate budget (`assets/engine.js`)
+- [ ] Verify AV1/VP9 encode inside the real WebView2 desktop exe (no GPU
+      assumed); pick the safe default codec accordingly. *Smoke-tested only:
+      the exe launches and renders the Pro UI with the codec select; the
+      encode path inside WebView2 still needs a manual run.*
+- [x] Decide free-tier limits: **kept at 200 MiB / 5 min**. The memory reason
+      is gone (input is read lazily), but they remain the clear Pro upsell.
+      Revisit only if sales data says otherwise.
+- [x] Large outputs: Pro single-clip output streams into a file chosen with
+      the save picker (`showSaveFilePicker`, `StreamTarget`, chunked). Verified
+      headless: streamed bytes match the buffered encode, playable, cancel is
+      clean. Falls back to in-memory `BufferTarget` where the picker is missing
+      (the desktop `app://` shell may lack it: unverified).
+- [ ] Batch output still buffers in memory per clip (streaming for batch needs
+      a folder picker and per-file naming; not done).
+- [x] Rebuilt Pro exe (`release/TPT-Video-Compressor-Pro.zip`, exe 2.0 MB),
+      free bundle in the web repo's `public/apps/video-compressor/` (stale
+      ffmpeg files removed), and retook `gumroad-cover.png` from the Pro UI
+- [ ] Legal: get a professional opinion that relying on OS/browser codecs
+      removes the patent-fee exposure for distributing this app
+
 ## Remaining (manual, owner)
-1. Gumroad: create the product from `GUMROAD.md` copy, upload
+1. Review the uncommitted web-repo changes in `public/apps/video-compressor/`
+   and the Gumroad assets, then commit.
+2. Gumroad: create the product from `GUMROAD.md` copy, upload
    `release\TPT-Video-Compressor-Pro.zip`, cover `gumroad-cover.png`.
-2. Paste the product URL into the registry entry's `gumroadUrl`, flip
+3. Paste the product URL into the registry entry's `gumroadUrl`, flip
    `status` to `'live'`, commit + push + deploy the web repo.
-3. Optional: bump `@ffmpeg/core` (>= 0.12.10) to re-test VP9/WebM —
-   see assets/README.md bump procedure.
+4. Decide the free-tier limits and the legal opinion (Phase 5 above).
+
+## Licensing follow-ups (royalty-free policy)
+- **Resolved:** the ffmpeg core (GPL, built `--enable-gpl` with x264/x265) is
+  no longer shipped anywhere in this app.
+- **Input decoding**: reading users' H.264/HEVC/AAC files runs the browser's
+  and OS's licensed decoders. That is residual decoder-patent exposure that
+  the output-only policy does not remove. Needs the legal opinion above.
+- Alternative engine (tpt-kinetix) is still not ready and is not needed now.

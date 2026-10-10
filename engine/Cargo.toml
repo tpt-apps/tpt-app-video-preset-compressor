@@ -2,7 +2,7 @@
 name = "tpt-video-engine"
 version = "0.1.0"
 edition = "2021"
-description = "TPT Video Compressor engine - export preset model, ffmpeg command building, and probe-log parsing."
+description = "TPT Video Compressor engine model - export presets, encode spec for the WebCodecs engine, media info."
 publish = false
 
 [dependencies]

@@ -19,7 +19,7 @@ pro:
 bindgen:
     pwsh -NoLogo -NoProfile -File build.ps1 -SkipBuild
 
-# Engine units (preset model / arg builder / probe parser), then type-check
+# Engine units (preset model / encode spec / media info), then type-check
 # the wasm lib (free) and the desktop shell.
 test:
     cargo test -p tpt-video-engine

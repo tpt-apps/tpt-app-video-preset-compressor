@@ -11,23 +11,22 @@
 //!   is raw web-sys appended into placeholder containers, wired with
 //!   `Closure`s, exactly like fea-lite's canvas viewer.
 //!
-//! The engine (preset model, ffmpeg argument building, probe-log parsing)
-//! lives in `tpt-video-engine`; ffmpeg itself runs in the vendored
-//! ffmpeg.wasm worker behind `crate::ffmpeg`.
+//! The engine (preset model, `EncodeSpec`, `MediaInfo`) lives in
+//! `tpt-video-engine`; the transcoding itself runs in the browser's own
+//! WebCodecs via `assets/engine.js`, reached through `crate::engine`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use tpt_appfront_core::{create_effect, Signal, UITree};
-use tpt_video_engine::cmd;
-use tpt_video_engine::preset::{Audio, Container, ExportPreset, Quality};
+use tpt_video_engine::media::MediaInfo;
 #[cfg(feature = "pro")]
 use tpt_video_engine::preset::Corner;
-use tpt_video_engine::probe::{parse_probe_log, MediaInfo};
+use tpt_video_engine::preset::{Audio, Container, ExportPreset, Quality, VideoCodec};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::ffmpeg::FFmpeg;
+use crate::engine::{Compressed, Engine};
 
 #[cfg(feature = "pro")]
 use tpt_video_engine::preset::Watermark;
@@ -39,16 +38,13 @@ const FREE_MAX_INPUT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
 #[cfg(not(feature = "pro"))]
 const FREE_MAX_DURATION_SECS: f64 = 5.0 * 60.0;
 
-/// Virtual filenames inside the ffmpeg worker's in-memory FS.
-const INPUT_NAME: &str = "input.clip";
-#[cfg(feature = "pro")]
-const WATERMARK_FS_NAME: &str = cmd::WATERMARK_FILENAME;
-
 /// The currently selected source clip (free edition: the one clip).
 #[derive(Clone)]
 struct SourceClip {
     file_name: String,
     size_bytes: u64,
+    /// The picked file itself; read lazily by the engine, never copied.
+    file: web_sys::File,
     /// Blob URL of the original file for the <video> preview.
     preview_url: String,
     /// Filled once the engine has probed the file; `None` until then.
@@ -76,7 +72,8 @@ struct JobOutcome {
     output_name: String,
     output_size: u64,
     input_size: u64,
-    container_label: &'static str,
+    /// e.g. "WebM · VP9 + Opus" — shown in the result details.
+    codec_label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -408,11 +405,23 @@ fn shell_tree() -> UITree<Msg> {
                                 .on_input(|value| Msg::PlatformChosen(value));
                         })
                         .class("vc-field");
-                                                // Format: MP4/H.264 only. The core's libvpx-vp9
-                        // traps ("memory access out of bounds") on the
-                        // current @ffmpeg/core build, so WebM is not offered
-                        // from the UI (the engine keeps the code path for a
-                        // future core bump).
+                        // Output is always WebM with Opus audio — royalty-free
+                        // by policy (no H.264/AAC patent licences) — so the
+                        // only choice here is the video codec.
+                        row.container(|field| {
+                            styled_text(field, "Video codec", "vc-label");
+                            field
+                                .select(
+                                    [
+                                        ("vp9", "Auto (VP9, balanced)"),
+                                        ("av1", "Smallest (AV1, slowest)"),
+                                        ("vp8", "Compatible (VP8, fastest)"),
+                                    ],
+                                    "vp9",
+                                )
+                                .class("vc-input vc-codec");
+                        })
+                        .class("vc-field");
                     })
                     .class("vc-row");
                     card.container(|row| {
@@ -476,7 +485,7 @@ fn shell_tree() -> UITree<Msg> {
                     .class("vc-row");
                     styled_text(
                         card,
-                        "Quality is quality-targeted (CRF), so the same preset adapts to the footage — a talking head compresses smaller than sports.",
+                        "Quality sets the video bitrate budget for the clip's size and frame rate. Higher is sharper but larger.",
                         "vc-hint",
                     );
 
@@ -736,7 +745,7 @@ fn results_view(job: Job) -> UITree<Msg> {
                     summary,
                     format!(
                         "{} · plays in the preview above; download it to keep it.",
-                        outcome.container_label
+                        outcome.codec_label
                     ),
                     "vc-detail",
                 );
@@ -778,9 +787,10 @@ fn presets_view(presets: Vec<ExportPreset>) -> UITree<Msg> {
                         format!(
                             "{} · {} · {}{}",
                             preset.name,
-                            match preset.container {
-                                Container::Mp4 => "MP4",
-                                Container::WebM => "WebM",
+                            match preset.codec {
+                                VideoCodec::Av1 => "WebM / AV1",
+                                VideoCodec::Vp9 => "WebM / VP9",
+                                VideoCodec::Vp8 => "WebM / VP8",
                             },
                             if preset.max_width == 0 {
                                 "original width".to_string()
@@ -1044,6 +1054,7 @@ fn start_source_flow(file: &web_sys::File, source: &Signal<Option<Rc<SourceClip>
     source.set(Some(Rc::new(SourceClip {
         file_name,
         size_bytes,
+        file: file.clone(),
         preview_url,
         info: None,
     })));
@@ -1055,8 +1066,12 @@ fn start_source_flow(file: &web_sys::File, source: &Signal<Option<Rc<SourceClip>
         match load_engine().await {
             Ok(engine) => {
                 job.set(Job::Working("Probing clip\u{2026}".to_string()));
-                match probe_fs_clip(&engine, &file).await {
+                match engine.probe(&file).await {
                     Ok(info) => {
+                        if let Err(err) = check_decodable(&info) {
+                            job.set(Job::Failed(err));
+                            return;
+                        }
                         if let Some(mut clip) = source.get().map(|c| (*c).clone()) {
                             // Free edition: duration limit.
                             #[cfg(not(feature = "pro"))]
@@ -1165,18 +1180,17 @@ fn set_compress_busy(container: &web_sys::Element, busy: bool) -> Result<(), JsV
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    /// The one ffmpeg worker connection for the app's lifetime.
-    static ENGINE: RefCell<Option<Rc<FFmpeg>>> = const { RefCell::new(None) };
-    /// Where `ffmpeg.rs`'s log callback currently delivers stderr lines.
-    static LOG_SINK: RefCell<Option<Rc<RefCell<String>>>> = const { RefCell::new(None) };
-    /// Where the progress callback currently delivers ratios.
-    static PROGRESS_SINK: RefCell<Option<Box<dyn Fn(f64, f64)>>> = const { RefCell::new(None) };
+    /// The one engine connection (the loaded `engine.js` module) for the
+    /// app's lifetime.
+    static ENGINE: RefCell<Option<Rc<Engine>>> = const { RefCell::new(None) };
     /// (pro) The watermark PNG bytes picked via the hidden input.
     #[cfg(feature = "pro")]
     static WATERMARK_BYTES: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
-    /// (pro) Batch items in enqueue order, with their bytes.
+    /// (pro) Batch items in enqueue order. The `File` handles are kept
+    /// rather than copied into memory, so a folder of large clips costs no
+    /// extra RAM until each one is actually encoded.
     #[cfg(feature = "pro")]
-    static BATCH_FILES: RefCell<Vec<(String, u64, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+    static BATCH_FILES: RefCell<Vec<(String, u64, web_sys::File)>> = const { RefCell::new(Vec::new()) };
     /// (pro) Batch outputs in completion order.
     #[cfg(feature = "pro")]
     static BATCH_OUTPUTS: RefCell<Vec<Rc<JobOutcome>>> = const { RefCell::new(Vec::new()) };
@@ -1194,77 +1208,55 @@ fn watermark_bytes() -> Option<Vec<u8>> {
     WATERMARK_BYTES.with(|slot| slot.borrow().clone())
 }
 
-/// Loads the engine once; later calls reuse the connection. The log and
-/// progress callbacks are installed here, once, and route through the
-/// module-wide sinks.
-async fn load_engine() -> Result<Rc<FFmpeg>, String> {
+/// Loads the engine once; later calls reuse the module. A browser without
+/// WebCodecs (or without an AV1/VP9/VP8 encoder) comes back as the reason
+/// the UI shows.
+async fn load_engine() -> Result<Rc<Engine>, String> {
     if let Some(engine) = ENGINE.with(|slot| slot.borrow().clone()) {
         return Ok(engine);
     }
-    let log_sink = LOG_SINK.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(Rc::new(RefCell::new(String::new())));
-        }
-        slot.as_ref().map(Rc::clone)
-    });
-    let engine = FFmpeg::load(
-        Rc::new(move |kind, message| {
-            // Only stderr is captured (the probe parser reads it); other
-            // stream tags go to the devtools console for debugging.
-            if kind == "stderr" {
-                if let Some(sink) = &log_sink {
-                    let mut text = sink.borrow_mut();
-                    text.push_str(message);
-                    text.push('\n');
-                }
-            } else {
-                console_log(&format!("ffmpeg[{kind}] {message}"));
-            }
-        }),
-        Rc::new(move |ratio, time| {
-            PROGRESS_SINK.with(|slot| {
-                if let Some(cb) = slot.borrow().as_ref() {
-                    cb(ratio, time);
-                }
-            });
-        }),
-    )
-    .await
-    .map_err(|err| format!("engine load failed: {}", js_error_text(&err)))?;
-    let engine = Rc::new(engine);
+    let engine = Rc::new(Engine::load().await?);
     ENGINE.with(|slot| *slot.borrow_mut() = Some(engine.clone()));
     Ok(engine)
 }
 
-/// Reads the clip, stages it in the worker FS, runs `ffmpeg -i`, and
-/// parses the stderr the logger delivered. The exit code is 1 by design
-/// (no output requested) and is ignored — the worker survives failed runs.
-async fn probe_fs_clip(engine: &FFmpeg, file: &web_sys::File) -> Result<MediaInfo, String> {
-    let bytes = read_file_bytes(file).await.map_err(|e| js_error_text(&e))?;
-    engine
-        .write_file(INPUT_NAME, &bytes)
-        .await
-        .map_err(|e| js_error_text(&e))?;
-
-    LOG_SINK.with(|slot| {
-        if let Some(sink) = slot.borrow().as_ref() {
-            sink.borrow_mut().clear();
-        }
-    });
-    let _ = engine.exec(&["-hide_banner", "-i", INPUT_NAME]).await;
-
-    let log = LOG_SINK.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|sink| sink.borrow().clone())
-            .unwrap_or_default()
-    });
-    parse_probe_log(&log).ok_or_else(|| "no video stream found (is this really a video file?)".to_string())
+/// The branding PNG bytes, when a watermark has been picked (pro only).
+fn current_watermark_png() -> Option<Vec<u8>> {
+    #[cfg(feature = "pro")]
+    {
+        watermark_bytes()
+    }
+    #[cfg(not(feature = "pro"))]
+    {
+        None
+    }
 }
 
-/// The main compression run: reads the form, builds the command, encodes,
-/// reads the output back, and publishes the Done outcome.
+/// Refuses a clip this browser can't decode, with a message that says why.
+/// Decoding is the browser's (and OS's) job, so this is where an unsupported
+/// codec surfaces instead of a half-finished encode.
+fn check_decodable(info: &MediaInfo) -> Result<(), String> {
+    if !info.can_decode_video {
+        return Err(format!(
+            "This browser cannot decode the video ({}). Try a current Chrome or Edge, or a different file.",
+            info.video_codec
+        ));
+    }
+    if let Some(audio) = info.audio.as_ref().filter(|a| !a.can_decode) {
+        return Err(format!(
+            "This browser cannot decode the audio ({}). Try a current Chrome or Edge, or a different file.",
+            audio.codec
+        ));
+    }
+    Ok(())
+}
+
+/// The main compression run: reads the form, encodes the clip in the
+/// engine, and publishes the Done outcome.
+///
+/// Everything that can fail synchronously (form, watermark) is checked
+/// before anything async starts, and the save picker is requested here, in
+/// the click handler, so the browser still treats it as a user gesture.
 fn run_compress(source: &Signal<Option<Rc<SourceClip>>>, job: &Signal<Job>) {
     let Some(clip) = source.get() else {
         job.set(Job::Failed("Pick a clip first.".to_string()));
@@ -1279,6 +1271,15 @@ fn run_compress(source: &Signal<Option<Rc<SourceClip>>>, job: &Signal<Job>) {
         }
     };
 
+    let watermark = current_watermark_png();
+    if preset.watermark.is_some() && watermark.is_none() {
+        job.set(Job::Failed("Pick a PNG for the branding overlay first.".to_string()));
+        return;
+    }
+    let spec = preset.to_spec(watermark.is_some());
+    let output_name = output_file_name(&clip.file_name, preset.extension());
+    let picker = save_picker(&output_name);
+
     let job = job.clone();
     let clip = (*clip).clone();
     wasm_bindgen_futures::spawn_local(async move {
@@ -1291,105 +1292,84 @@ fn run_compress(source: &Signal<Option<Rc<SourceClip>>>, job: &Signal<Job>) {
             }
         };
 
-        let source_width = clip.info.as_ref().map(|i| i.width).unwrap_or(0);
-        let wm_width = preset
-            .watermark
-            .as_ref()
-            .map(|_| cmd::resolve_watermark_width(&preset, source_width.max(1)));
-
-        #[cfg(feature = "pro")]
-        if preset.watermark.is_some() {
-            match watermark_bytes() {
-                Some(bytes) => {
-                    if let Err(err) = engine.write_file(WATERMARK_FS_NAME, &bytes).await {
-                        job.set(Job::Failed(format!(
-                            "Could not stage the watermark: {}",
-                            js_error_text(&err)
-                        )));
-                        return;
-                    }
-                }
-                None => {
-                    job.set(Job::Failed("Pick a PNG for the branding overlay first.".to_string()));
+        // Pro in a browser with the save picker: stream into the chosen file.
+        // Cancelling the dialog just stops; no picker means buffer in memory.
+        let target = match picker {
+            Some(promise) => match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(handle) => Some(handle),
+                Err(_) => {
+                    job.set(Job::Idle);
                     return;
                 }
-            }
-        }
-
-        // Progress: pipe core ratios into the Encoding state (coalesced to
-        // whole percent to keep re-renders cheap).
-        {
-            let job = job.clone();
-            PROGRESS_SINK.with(|slot| {
-                *slot.borrow_mut() = Some(Box::new(move |ratio, _time| {
-                    job_coalesce(&job, Job::Encoding(ratio.clamp(0.0, 1.0)));
-                }));
-            });
-        }
-
-        let output_name = output_file_name(&clip.file_name, preset.extension());
-        let output_fs_name = format!("output.{}", preset.extension());
-        let args = cmd::build_ffmpeg_args(&preset, INPUT_NAME, &output_fs_name, wm_width);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let exit = match engine.exec(&arg_refs).await {
-            Ok(code) => code,
-            Err(err) => {
-                PROGRESS_SINK.with(|slot| *slot.borrow_mut() = None);
-                job.set(Job::Failed(format!("Engine error while encoding: {}", js_error_text(&err))));
-                return;
-            }
+            },
+            None => None,
         };
-        PROGRESS_SINK.with(|slot| *slot.borrow_mut() = None);
 
-        if exit != 0 {
-            job.set(Job::Failed(format!(
-                "ffmpeg failed (exit {exit}) — try different settings or a lower quality."
-            )));
-            return;
-        }
+        // Progress ratios are coalesced to whole percent inside job_coalesce,
+        // which keeps re-renders cheap.
+        let progress: Rc<dyn Fn(f64)> = {
+            let job = job.clone();
+            Rc::new(move |ratio: f64| job_coalesce(&job, Job::Encoding(ratio.clamp(0.0, 1.0))))
+        };
+        job_coalesce(&job, Job::Encoding(0.0));
 
-        job_coalesce(&job, Job::Working("Reading result\u{2026}".to_string()));
-        match engine.read_file(&output_fs_name).await {
-            Ok(data) => {
-                engine.delete_file(&output_fs_name);
-                let outcome = publish_output(&clip, &output_name, &data, &preset);
+        match engine.compress(&clip.file, &spec, watermark.as_deref(), progress, target).await {
+            Ok(out) => {
+                let outcome = publish_output(clip.size_bytes, &output_name, &out, &preset);
                 LAST_OUTPUT.with(|slot| *slot.borrow_mut() = Some(outcome.clone()));
                 job.set(Job::Done(outcome));
             }
-            Err(err) => {
-                job.set(Job::Failed(format!(
-                    "ffmpeg reported success but the output could not be read: {}",
-                    js_error_text(&err)
-                )));
-            }
+            Err(err) => job.set(Job::Failed(format!("Compression failed: {err}"))),
         }
     });
 }
 
-/// Builds the blob URL for `data`, wires it into the output preview, and
-/// returns the outcome. (Split out so the batch runner can reuse it.)
-fn publish_output(clip: &SourceClip, output_name: &str, data: &[u8], preset: &ExportPreset) -> Rc<JobOutcome> {
-    let mime = match preset.container {
-        Container::Mp4 => "video/mp4",
-        Container::WebM => "video/webm",
-    };
-    let array = js_sys::Array::new();
-    array.push(&js_sys::Uint8Array::from(data));
-    let bag = web_sys::BlobPropertyBag::new();
-    bag.set_type(mime);
-    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&array, &bag).ok();
-    let url = blob
-        .and_then(|b| web_sys::Url::create_object_url_with_blob(&b).ok())
-        .unwrap_or_default();
+/// Opens the browser's save picker for `suggested` (Pro). Returns the pending
+/// promise, or `None` when the picker isn't available (free edition, or a
+/// browser without the File System Access API), in which case the output is
+/// buffered in memory instead. Must be called from the click handler.
+#[cfg(feature = "pro")]
+fn save_picker(suggested: &str) -> Option<js_sys::Promise> {
+    use js_sys::{Array, Function, Object, Reflect};
+    let window = web_sys::window()?;
+    let show = Reflect::get(&window, &JsValue::from_str("showSaveFilePicker"))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
 
+    let accept = Object::new();
+    let extensions = Array::new();
+    extensions.push(&JsValue::from_str(".webm"));
+    Reflect::set(&accept, &JsValue::from_str("video/webm"), &extensions).ok()?;
+    let video_type = Object::new();
+    Reflect::set(&video_type, &JsValue::from_str("description"), &JsValue::from_str("WebM video")).ok()?;
+    Reflect::set(&video_type, &JsValue::from_str("accept"), &accept).ok()?;
+    let types = Array::new();
+    types.push(&video_type);
+
+    let options = Object::new();
+    Reflect::set(&options, &JsValue::from_str("suggestedName"), &JsValue::from_str(suggested)).ok()?;
+    Reflect::set(&options, &JsValue::from_str("types"), &types).ok()?;
+
+    show.call1(&window, &options).ok()?.dyn_into::<js_sys::Promise>().ok()
+}
+
+#[cfg(not(feature = "pro"))]
+fn save_picker(_suggested: &str) -> Option<js_sys::Promise> {
+    None
+}
+
+/// Wraps the encoded WebM blob in a preview/download URL and returns the
+/// outcome. (Split out so the batch runner can reuse it.)
+fn publish_output(input_size: u64, output_name: &str, out: &Compressed, preset: &ExportPreset) -> Rc<JobOutcome> {
+    let url = web_sys::Url::create_object_url_with_blob(&out.blob).unwrap_or_default();
     let outcome = Rc::new(JobOutcome {
         output_url: url.clone(),
         output_name: output_name.to_string(),
-        output_size: data.len() as u64,
-        input_size: clip.size_bytes,
-        container_label: match preset.container {
-            Container::Mp4 => "MP4 / H.264",
-            Container::WebM => "WebM / VP9",
+        output_size: out.blob.size() as u64,
+        input_size,
+        codec_label: match preset.container {
+            Container::WebM => format!("WebM \u{00b7} {} + Opus", out.codec.to_uppercase()),
         },
     });
 
@@ -1449,7 +1429,7 @@ fn apply_saved_preset(container: &web_sys::Element, presets: &Signal<Vec<ExportP
     let list = presets.get();
     let Some(preset) = list.get(index) else { return };
     let preset = preset.clone();
-    write_select(container, ".vc-format", container_value(preset.container));
+    write_select(container, ".vc-codec", codec_value(preset.codec));
     write_select(container, ".vc-width", &preset.max_width.to_string());
     write_select(container, ".vc-fps", &preset.fps.to_string());
     write_select(container, ".vc-quality", quality_value(preset.quality));
@@ -1466,10 +1446,11 @@ fn delete_saved_preset(presets: &Signal<Vec<ExportPreset>>, index: usize) {
     }
 }
 
-fn container_value(c: Container) -> &'static str {
+fn codec_value(c: VideoCodec) -> &'static str {
     match c {
-        Container::Mp4 => "mp4",
-        Container::WebM => "webm",
+        VideoCodec::Av1 => "av1",
+        VideoCodec::Vp9 => "vp9",
+        VideoCodec::Vp8 => "vp8",
     }
 }
 
@@ -1483,9 +1464,9 @@ fn quality_value(q: Quality) -> &'static str {
 
 fn audio_value(a: Audio) -> &'static str {
     match a {
-        Audio::Aac128 => "128",
-        Audio::Aac96 => "96",
-        Audio::Aac64 => "64",
+        Audio::Opus128 => "128",
+        Audio::Opus96 => "96",
+        Audio::Opus64 => "64",
         Audio::None => "none",
     }
 }
@@ -1520,9 +1501,10 @@ fn wire_watermark_input(input: &web_sys::HtmlInputElement) {
     closure.forget();
 }
 
-/// (pro) Wires a batch input's change listener: reads every picked file's
-/// bytes at enqueue time (so the File handles can't go stale), appends to
-/// the queue, and leaves starting to the explicit Compress-queue button.
+/// (pro) Wires a batch input's change listener: keeps each picked `File`
+/// handle (the engine reads it lazily when its turn comes), appends the
+/// rows to the queue, and leaves starting to the explicit Compress-queue
+/// button.
 #[cfg(feature = "pro")]
 fn wire_batch_inputs(input: &web_sys::HtmlInputElement, queue: &Signal<Vec<QueueItem>>) {
     let input_for_change = input.clone();
@@ -1533,38 +1515,19 @@ fn wire_batch_inputs(input: &web_sys::HtmlInputElement, queue: &Signal<Vec<Queue
         if picked.is_empty() {
             return;
         }
-        let queue = queue.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut new_items = Vec::new();
-            let mut new_bytes = Vec::new();
-            for file in picked {
-                let name = file.name();
-                let size = file.size() as u64;
-                match read_file_bytes(&file).await {
-                    Ok(bytes) => {
-                        new_items.push(QueueItem {
-                            name: name.clone(),
-                            size_bytes: size,
-                            status: QueueStatus::Pending,
-                            output_slot: None,
-                        });
-                        new_bytes.push((name, size, bytes));
-                    }
-                    Err(_) => {
-                        new_items.push(QueueItem {
-                            name,
-                            size_bytes: size,
-                            status: QueueStatus::Failed("could not read file".to_string()),
-                            output_slot: None,
-                        });
-                    }
-                }
-            }
-            BATCH_FILES.with(|slot| slot.borrow_mut().extend(new_bytes));
-            let mut items = queue.get();
-            items.extend(new_items);
-            queue.set(items);
-        });
+        let mut items = queue.get();
+        for file in picked {
+            let name = file.name();
+            let size = file.size() as u64;
+            items.push(QueueItem {
+                name: name.clone(),
+                size_bytes: size,
+                status: QueueStatus::Pending,
+                output_slot: None,
+            });
+            BATCH_FILES.with(|slot| slot.borrow_mut().push((name, size, file)));
+        }
+        queue.set(items);
     });
     input
         .add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
@@ -1573,11 +1536,9 @@ fn wire_batch_inputs(input: &web_sys::HtmlInputElement, queue: &Signal<Vec<Queue
 }
 
 /// (pro) Runs the whole pending queue sequentially with the current form
-/// preset. One engine connection; the single-threaded core serializes.
+/// preset. One engine connection; each clip is encoded in turn.
 #[cfg(feature = "pro")]
 fn start_batch(queue: &Signal<Vec<QueueItem>>, batch: &Signal<BatchState>, job: &Signal<Job>) {
-    // Map queue rows to BATCH_FILES entries by name+size (enqueue order
-    // matches).
     let pending: Vec<usize> = queue
         .get()
         .iter()
@@ -1612,104 +1573,48 @@ fn start_batch(queue: &Signal<Vec<QueueItem>>, batch: &Signal<BatchState>, job: 
             }
         };
 
-        // Stage the watermark once, up front.
-        if preset.watermark.is_some() {
-            if let Some(wm_bytes) = watermark_bytes() {
-                let _ = engine.write_file(WATERMARK_FS_NAME, &wm_bytes).await;
-            }
-        }
+        // The branding PNG and the encode spec are the same for every clip.
+        let watermark = current_watermark_png();
+        let spec = preset.to_spec(watermark.is_some());
+        let ext = preset.extension();
 
         for (done_so_far, queue_index) in pending.into_iter().enumerate() {
             let Some((name, size)) = queue.get().get(queue_index).map(|i| (i.name.clone(), i.size_bytes)) else {
                 continue;
             };
-            let bytes = BATCH_FILES.with(|slot| {
+            let file = BATCH_FILES.with(|slot| {
                 slot.borrow()
                     .iter()
                     .find(|(n, s, _)| *n == name && *s == size)
-                    .map(|(_, _, b)| b.clone())
+                    .map(|(_, _, f)| f.clone())
             });
-            let Some(bytes) = bytes else {
+            let Some(file) = file else {
                 mark_queue_item(&queue, queue_index, QueueStatus::Failed("file data unavailable".to_string()));
                 continue;
             };
 
             mark_queue_item(&queue, queue_index, QueueStatus::Working);
-            if engine.write_file(INPUT_NAME, &bytes).await.is_err() {
-                mark_queue_item(&queue, queue_index, QueueStatus::Failed("could not stage file".to_string()));
-                continue;
-            }
-
-            // Probe for the watermark width (stderr parse; exit code ignored).
-            LOG_SINK.with(|slot| {
-                if let Some(sink) = slot.borrow().as_ref() {
-                    sink.borrow_mut().clear();
-                }
-            });
-            let _ = engine.exec(&["-hide_banner", "-i", INPUT_NAME]).await;
-            let log = LOG_SINK.with(|slot| {
-                slot.borrow().as_ref().map(|s| s.borrow().clone()).unwrap_or_default()
-            });
-            let source_width = parse_probe_log(&log).map(|i| i.width).unwrap_or(1920);
-            let wm_width = preset
-                .watermark
-                .as_ref()
-                .map(|_| cmd::resolve_watermark_width(&preset, source_width.max(1)));
-
-            let ext = preset.extension();
-            let output_fs_name = format!("batch_out.{ext}");
-            let args = cmd::build_ffmpeg_args(&preset, INPUT_NAME, &output_fs_name, wm_width);
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-
-            {
+            let progress: Rc<dyn Fn(f64)> = {
                 let job = job.clone();
-                PROGRESS_SINK.with(|slot| {
-                    *slot.borrow_mut() = Some(Box::new(move |ratio, _time| {
-                        job_coalesce(&job, Job::Encoding(ratio.clamp(0.0, 1.0)));
-                    }));
-                });
-            }
-            let exit = match engine.exec(&arg_refs).await {
-                Ok(code) => code,
-                Err(err) => {
-                    PROGRESS_SINK.with(|slot| *slot.borrow_mut() = None);
-                    mark_queue_item(&queue, queue_index, QueueStatus::Failed(js_error_text(&err)));
-                    batch.set(BatchState::Running { total, finished: done_so_far + 1 });
-                    continue;
-                }
+                Rc::new(move |ratio: f64| job_coalesce(&job, Job::Encoding(ratio.clamp(0.0, 1.0))))
             };
-            PROGRESS_SINK.with(|slot| *slot.borrow_mut() = None);
-
-            if exit != 0 {
-                mark_queue_item(&queue, queue_index, QueueStatus::Failed(format!("ffmpeg exit {exit}")));
-            } else {
-                match engine.read_file(&output_fs_name).await {
-                    Ok(data) => {
-                        engine.delete_file(&output_fs_name);
-                        let out_name = output_file_name(&name, ext);
-                        let pseudo = SourceClip {
-                            file_name: name.clone(),
-                            size_bytes: bytes.len() as u64,
-                            preview_url: String::new(),
-                            info: None,
-                        };
-                        let outcome = publish_output(&pseudo, &out_name, &data, &preset);
-                        let slot = BATCH_OUTPUTS.with(|slot| {
-                            let mut list = slot.borrow_mut();
-                            list.push(outcome);
-                            list.len() - 1
-                        });
-                        let mut items = queue.get();
-                        if let Some(item) = items.get_mut(queue_index) {
-                            item.status = QueueStatus::Done;
-                            item.output_slot = Some(slot);
-                        }
-                        queue.set(items);
+            match engine.compress(&file, &spec, watermark.as_deref(), progress, None).await {
+                Ok(out) => {
+                    let output_name = output_file_name(&name, ext);
+                    let outcome = publish_output(size, &output_name, &out, &preset);
+                    let slot = BATCH_OUTPUTS.with(|slot| {
+                        let mut list = slot.borrow_mut();
+                        list.push(outcome);
+                        list.len() - 1
+                    });
+                    let mut items = queue.get();
+                    if let Some(item) = items.get_mut(queue_index) {
+                        item.status = QueueStatus::Done;
+                        item.output_slot = Some(slot);
                     }
-                    Err(err) => {
-                        mark_queue_item(&queue, queue_index, QueueStatus::Failed(js_error_text(&err)));
-                    }
+                    queue.set(items);
                 }
+                Err(err) => mark_queue_item(&queue, queue_index, QueueStatus::Failed(err)),
             }
 
             batch.set(BatchState::Running { total, finished: done_so_far + 1 });
@@ -1737,9 +1642,13 @@ fn read_preset_from_form() -> Result<ExportPreset, String> {
     let Some(container) = current_container() else {
         return Err("App is still starting — try again.".to_string());
     };
-    // MP4/H.264 is the only format the UI offers (see the shell note);
-    // `Container::WebM` stays available to the engine and saved presets.
-    let kind = Container::Mp4;
+    // WebM is the only container: royalty-free output by policy.
+    let kind = Container::WebM;
+    let codec = match read_input(&container, ".vc-codec").as_str() {
+        "av1" => VideoCodec::Av1,
+        "vp8" => VideoCodec::Vp8,
+        _ => VideoCodec::Vp9,
+    };
     let max_width: u16 = read_input(&container, ".vc-width").trim().parse().unwrap_or(0);
     let fps: u16 = read_input(&container, ".vc-fps").trim().parse().unwrap_or(0);
     let quality = match read_input(&container, ".vc-quality").as_str() {
@@ -1748,10 +1657,10 @@ fn read_preset_from_form() -> Result<ExportPreset, String> {
         _ => Quality::Balanced,
     };
     let audio = match read_input(&container, ".vc-audio").as_str() {
-        "128" => Audio::Aac128,
-        "64" => Audio::Aac64,
+        "128" => Audio::Opus128,
+        "64" => Audio::Opus64,
         "none" => Audio::None,
-        _ => Audio::Aac96,
+        _ => Audio::Opus96,
     };
 
     #[cfg(feature = "pro")]
@@ -1779,6 +1688,7 @@ fn read_preset_from_form() -> Result<ExportPreset, String> {
     Ok(ExportPreset {
         name: String::new(),
         container: kind,
+        codec,
         max_width,
         fps,
         quality,
@@ -1796,7 +1706,7 @@ fn apply_platform_preset(container: &web_sys::Element, label: &str) {
         return;
     }
     if let Some((_, preset)) = ExportPreset::platform_presets().into_iter().find(|(l, _)| *l == label) {
-        write_select(container, ".vc-format", container_value(preset.container));
+        write_select(container, ".vc-codec", codec_value(preset.codec));
         write_select(container, ".vc-width", &preset.max_width.to_string());
         write_select(container, ".vc-fps", &preset.fps.to_string());
         write_select(container, ".vc-quality", quality_value(preset.quality));
@@ -1899,16 +1809,19 @@ fn job_coalesce(job: &Signal<Job>, next: Job) {
     }
 }
 
+#[cfg(feature = "pro")]
 async fn read_file_bytes(file: &web_sys::File) -> Result<Vec<u8>, JsValue> {
     let promise = file.array_buffer();
     let buffer = wasm_bindgen_futures::JsFuture::from(promise).await?;
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
+#[cfg(feature = "pro")]
 fn js_error_text(err: &JsValue) -> String {
     err.as_string().unwrap_or_else(|| format!("{err:?}"))
 }
 
+#[cfg(feature = "pro")]
 fn console_log(message: &str) {
     #[cfg(target_arch = "wasm32")]
     {

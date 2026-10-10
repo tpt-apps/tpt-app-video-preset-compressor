@@ -51,7 +51,7 @@ Stop re-configuring export settings for every client. Save presets per client an
 ```
 Saved per-client presets
 Batch folder processing
-No file-size/length limits
+No clip length limits
 Works offline
 One-time purchase
 ```
@@ -70,10 +70,16 @@ size and format requirements. HandBrake is free and excellent at raw
 compression but has no concept of "client presets" — every job starts from
 scratch.
 
+Output is royalty-free WebM (AV1, VP9 or VP8 video + Opus audio) — the app
+ships no patent-encumbered H.264/AAC codec code. It decodes your footage with
+the codecs already in your browser or Windows. WebM plays in all modern
+browsers and is accepted by YouTube, Vimeo and most web embeds; some platforms
+(e.g. Instagram, TikTok) require MP4 uploads, so check your target first.
+
 Pro edition (this download):
 - Unlimited saved per-client presets (free has none saved)
 - Batch folder processing
-- Longer file support with no browser memory limits
+- No clip length limit
 
 Try the free single-clip edition first, right in your browser, no install:
 tptsolutions.co.nz/tools/video-compressor

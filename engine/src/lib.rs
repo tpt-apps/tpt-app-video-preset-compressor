@@ -1,13 +1,16 @@
-//! TPT Video Compressor engine.
+//! TPT Video Compressor engine model.
 //!
-//! Pure, target-independent Rust: the export-preset model, the ffmpeg
-//! argument builder that turns a preset into a command line for the
-//! ffmpeg.wasm core, and the parser that reads media metadata back out of
-//! `ffmpeg -i` log output. No wasm or DOM code lives here, so the whole
-//! crate runs as ordinary host tests (`cargo test -p tpt-video-engine`).
+//! Pure, target-independent Rust: the export-preset model, the
+//! [`encode::EncodeSpec`] handed to the browser-side WebCodecs engine
+//! (`assets/engine.js`), and the [`media::MediaInfo`] it reports back. No
+//! wasm or DOM code lives here, so the whole crate runs as ordinary host
+//! tests (`cargo test -p tpt-video-engine`).
+//!
+//! Royalty-free policy: the only output codecs that exist in this model are
+//! AV1 / VP9 / VP8 video and Opus audio, in WebM.
 
-pub mod cmd;
+pub mod encode;
+pub mod media;
 pub mod preset;
-pub mod probe;
 
 pub use preset::ExportPreset;

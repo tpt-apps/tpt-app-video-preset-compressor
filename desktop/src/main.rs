@@ -19,9 +19,10 @@
 //! 4. the embedded copy, extracted once into the OS temp directory — this
 //!    is the path a real end user's double-click actually takes.
 //!
-//! The app bundle drives ffmpeg.wasm inside the webview (the same engine as
-//! the free edition — no native ffmpeg sidecar), so the Pro exe is one
-//! self-contained download with no system dependencies beyond WebView2.
+//! The app bundle transcodes inside the webview with the browser's own
+//! WebCodecs (the same engine as the free edition — no native codec sidecar),
+//! so the Pro exe is one self-contained download with no system dependencies
+//! beyond WebView2.
 
 use std::path::PathBuf;
 

@@ -8,13 +8,13 @@
          rejects, and the release profile (opt-level = "z", lto, strip)
          already keeps the payload small. -->
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="0" />
-    <!-- The vendored ffmpeg.wasm runtime must sit flat, next to the glue,
-         in every host (src/ffmpeg.rs resolves the files relative to the
-         glue module's own URL). -->
-    <link data-trunk rel="copy-file" href="assets/ffmpeg.js" />
-    <link data-trunk rel="copy-file" href="assets/814.ffmpeg.js" />
-    <link data-trunk rel="copy-file" href="assets/ffmpeg-core.js" />
-    <link data-trunk rel="copy-file" href="assets/ffmpeg-core.wasm" />
+    <!-- The vendored engine (engine.js + mediabunny) must sit flat, next to
+         the glue, in every host (src/engine.rs resolves engine.js relative
+         to the glue module's own URL, and engine.js imports mediabunny
+         relative to itself). -->
+    <link data-trunk rel="copy-file" href="assets/engine.js" />
+    <link data-trunk rel="copy-file" href="assets/mediabunny.min.mjs" />
+    <link data-trunk rel="copy-file" href="assets/mediabunny.LICENSE" />
   </head>
   <body>
     <!-- Marker div: `start()` mounts here for standalone dev only; when the

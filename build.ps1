@@ -5,13 +5,13 @@
 #   wasm-bindgen --target web  ->  web repo public/apps/video-compressor/
 #   when TPT_WEB_REPO is set (glue named video-compressor.js, wasm keeps its
 #   _bg.wasm name - the glue resolves it via import.meta.url), otherwise
-#   dist\web. The vendored ffmpeg.wasm runtime (assets/) is copied flat next
-#   to the glue either way - src/ffmpeg.rs resolves those files relative to
-#   the glue module's own URL at runtime.
+#   dist\web. The vendored engine (assets/engine.js + mediabunny) is copied
+#   flat next to the glue either way - src/engine.rs resolves engine.js
+#   relative to the glue module's own URL at runtime.
 # Pro desktop edition:     ./build.ps1 -Pro
 #   trunk build --release --features pro (its own independent wasm build,
 #   into dist\ - NOT the wasm-bindgen path above; trunk also copies the
-#   ffmpeg assets into dist\ via index.html's copy-file hooks) + cargo
+#   engine assets into dist\ via index.html's copy-file hooks) + cargo
 #   build the native webview exe, which embeds dist\ into the exe.
 #   Deliberately does not touch public/apps/video-compressor/: that is the
 #   free in-browser demo's bundle, and it must never be built with
@@ -44,8 +44,9 @@ $OutName = "video-compressor"
 $Slug = "video-compressor"
 $DefaultWebRepo = "D:\Programming\2 WIP\TPT Electrician\tpt-electrician-nz-2"
 
-# The vendored ffmpeg.wasm runtime, shipped flat next to the glue.
-$FfmpegAssets = @("ffmpeg.js", "814.ffmpeg.js", "ffmpeg-core.js", "ffmpeg-core.wasm")
+# The vendored transcoding engine, shipped flat next to the glue. Decoding
+# and encoding run on the browser's own WebCodecs; no codec code is shipped.
+$EngineAssets = @("engine.js", "mediabunny.min.mjs", "mediabunny.LICENSE")
 
 Write-Host "== TPT Video Compressor build ==" -ForegroundColor Cyan
 
@@ -96,17 +97,15 @@ foreach ($artifact in @($Glue, $BgWasm)) {
     if (-not (Test-Path $artifact)) { throw "wasm-bindgen did not produce $artifact" }
 }
 
-Write-Host "-- copy ffmpeg.wasm runtime (flat, next to the glue)" -ForegroundColor Cyan
-foreach ($asset in $FfmpegAssets) {
+Write-Host "-- copy engine runtime (flat, next to the glue)" -ForegroundColor Cyan
+foreach ($asset in $EngineAssets) {
     $source = Join-Path $PSScriptRoot "assets\$asset"
     if (-not (Test-Path $source)) { throw "missing vendored asset $source" }
     Copy-Item -Force $source (Join-Path $Dest $asset)
 }
 
-# Size report. The app payload and the ffmpeg core are budgeted separately:
-# the core is vendored upstream code (~10 MB gz) and its size is a constant
-# of the engine choice (see todo.md Phase 4); only the app's own payload is
-# tuned (opt-level = z, lto, strip).
+# Size report: the app's own wasm payload (tuned with opt-level = z, lto,
+# strip). mediabunny is a small JS module and is reported by its file size.
 Add-Type -AssemblyName System.IO.Compression
 function Get-Gzip-Bytes([string]$Path) {
     $rawBytes = [System.IO.File]::ReadAllBytes($Path)
@@ -126,9 +125,9 @@ if ($appGz -gt 2MB) {
     Write-Warning "app payload exceeds the ~2 MB gzip budget"
 }
 
-$coreRaw = (Get-Item (Join-Path $Dest "ffmpeg-core.wasm")).Length
-$coreGz = Get-Gzip-Bytes (Join-Path $Dest "ffmpeg-core.wasm")
-Write-Host "-- ffmpeg-core.wasm (vendored, tracked separately): $coreRaw bytes raw, $coreGz bytes gzipped ($([math]::Round($coreGz / 1MB, 1)) MB gz)" -ForegroundColor Cyan
+$mbRaw = (Get-Item (Join-Path $Dest "mediabunny.min.mjs")).Length
+$mbGz = Get-Gzip-Bytes (Join-Path $Dest "mediabunny.min.mjs")
+Write-Host "-- mediabunny.min.mjs (vendored): $mbRaw bytes raw, $mbGz bytes gzipped ($([math]::Round($mbGz / 1KB, 1)) KB gz)" -ForegroundColor Cyan
 
 Write-Host "-- done" -ForegroundColor Green
 if (-not $WebRepo) {
